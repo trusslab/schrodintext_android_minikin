@@ -24,6 +24,8 @@
 #include <minikin/FontCollection.h>
 #include <minikin/MinikinFontFreeType.h>
 
+#define ENCRYPTED_ASCII_NUM	95 //32 to 126 where 32 is first visible character (space)
+
 namespace minikin {
 
 // The Bitmap class is for debugging. We'll probably move it out
@@ -80,7 +82,8 @@ enum {
 class Layout {
 public:
 
-    Layout() : mGlyphs(), mAdvances(), mCollection(0), mFaces(), mAdvance(0), mBounds() {
+    Layout() : mGlyphs(), mAdvances(), mCollection(0), mFaces(), mAdvance(0), mBounds(),
+               mGlyphCodebook(NULL), mCodebookSize(0) {
         mBounds.setEmpty();
     }
 
@@ -91,6 +94,9 @@ public:
     void setFontCollection(const FontCollection* collection);
 
     void doLayout(const uint16_t* buf, size_t start, size_t count, size_t bufSize,
+        int bidiFlags, const FontStyle &style, const MinikinPaint &paint);
+        
+    void doEncryptedLayout(const void* buf, size_t start, size_t count, size_t bufSize,
         int bidiFlags, const FontStyle &style, const MinikinPaint &paint);
 
     static float measureText(const uint16_t* buf, size_t start, size_t count, size_t bufSize,
@@ -122,6 +128,9 @@ public:
     float getCharAdvance(size_t i) const { return mAdvances[i]; }
 
     void getBounds(MinikinRect* rect);
+    
+    const uint32_t *getGlyphCodebook() const;
+    unsigned int getCodebookSize() const;
 
     // Purge all caches, useful in low memory conditions
     static void purgeCaches();
@@ -138,18 +147,31 @@ private:
     static float doLayoutRunCached(const uint16_t* buf, size_t runStart, size_t runLength,
         size_t bufSize, bool isRtl, LayoutContext* ctx, size_t dstStart,
         const FontCollection* collection, Layout* layout, float* advances);
+        
+    void doEncryptedLayoutRunCached(const void* buf, size_t start, size_t count, size_t bufSize,
+        bool isRtl, LayoutContext* ctx, size_t dstStart,
+	const FontCollection* collection, Layout* layout, float* advances);
 
     // Lay out a single word
     static float doLayoutWord(const uint16_t* buf, size_t start, size_t count, size_t bufSize,
         bool isRtl, LayoutContext* ctx, size_t bufStart, const FontCollection* collection,
         Layout* layout, float* advances);
+        
+    void doEncryptedLayoutWord(const void* buf, size_t start, size_t count, size_t bufSize,
+        bool isRtl, LayoutContext* ctx, size_t bufStart, const FontCollection* collection,
+	Layout* layout, float* advances);
 
     // Lay out a single bidi run
     void doLayoutRun(const uint16_t* buf, size_t start, size_t count, size_t bufSize,
         bool isRtl, LayoutContext* ctx);
+        
+    void doEncryptedLayoutRun(const void* buf, size_t start, size_t count, size_t bufSize,
+        bool isRtl, LayoutContext* ctx);
 
     // Append another layout (for example, cached value) into this one
     void appendLayout(Layout* src, size_t start);
+
+    void appendEncryptedLayout(Layout* src, size_t start);
 
     std::vector<LayoutGlyph> mGlyphs;
     std::vector<float> mAdvances;
@@ -158,6 +180,8 @@ private:
     std::vector<FakedFont> mFaces;
     float mAdvance;
     MinikinRect mBounds;
+    uint32_t *mGlyphCodebook;
+    unsigned int mCodebookSize;
 };
 
 }  // namespace android

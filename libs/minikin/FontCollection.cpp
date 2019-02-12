@@ -465,6 +465,24 @@ void FontCollection::itemize(const uint16_t *string, size_t string_size, FontSty
     } while (nextCh != kEndOfString);
 }
 
+// We don't need to pass the string here.
+void FontCollection::itemizeEncrypted(size_t string_size, FontStyle style,
+        vector<Run>* result) const {
+    Run* run = NULL;
+    // The first font family (the default) is used for Encrypted Mode.
+    FontFamily* family = mFamilies[0];
+    Run dummy;
+    result->push_back(dummy);
+    run = &result->back();
+    if (family == NULL) {
+        run->fakedFont.font = NULL;
+    } else {
+        run->fakedFont = family->getClosestMatch(style);
+    }
+    run->start = 0;
+    run->end = string_size;
+}
+
 MinikinFont* FontCollection::baseFont(FontStyle style) {
     return baseFontFaked(style).font;
 }

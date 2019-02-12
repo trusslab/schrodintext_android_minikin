@@ -41,6 +41,7 @@
 #include "MinikinInternal.h"
 #include <minikin/MinikinFontFreeType.h>
 #include <minikin/Layout.h>
+#include <utils/Log.h>
 
 using std::string;
 using std::vector;
@@ -111,13 +112,26 @@ class LayoutCacheKey {
 public:
     LayoutCacheKey(const FontCollection* collection, const MinikinPaint& paint, FontStyle style,
             const uint16_t* chars, size_t start, size_t count, size_t nchars, bool dir)
-            : mChars(chars), mNchars(nchars),
+            : 
+            mChars(chars), mNchars(nchars), mCharsEncrypted(NULL),
             mStart(start), mCount(count), mId(collection->getId()), mStyle(style),
             mSize(paint.size), mScaleX(paint.scaleX), mSkewX(paint.skewX),
             mLetterSpacing(paint.letterSpacing),
             mPaintFlags(paint.paintFlags), mHyphenEdit(paint.hyphenEdit), mIsRtl(dir),
             mHash(computeHash()) {
     }
+
+    LayoutCacheKey(const FontCollection* collection, const MinikinPaint& paint, FontStyle style,
+            const void* chars, size_t start, size_t count, size_t nchars, bool dir)
+            :
+            mChars(NULL), mNchars(nchars), mCharsEncrypted(chars),
+            mStart(start), mCount(count), mId(collection->getId()), mStyle(style),
+            mSize(paint.size), mScaleX(paint.scaleX), mSkewX(paint.skewX),
+            mLetterSpacing(paint.letterSpacing),
+            mPaintFlags(paint.paintFlags), mHyphenEdit(paint.hyphenEdit), mIsRtl(dir),
+            mHash(computeHash()) {
+    }
+    
     bool operator==(const LayoutCacheKey &other) const;
 
     hash_t hash() const {
@@ -130,9 +144,14 @@ public:
         mChars = charsCopy;
     }
     void freeText() {
-        delete[] mChars;
-        mChars = NULL;
-    }
+		if (mChars) {
+        	delete[] mChars;
+        	mChars = NULL;
+		}
+		if (mCharsEncrypted) {
+            mCharsEncrypted = NULL;
+		}
+	}
 
     void doLayout(Layout* layout, LayoutContext* ctx, const FontCollection* collection) const {
         layout->setFontCollection(collection);
@@ -140,10 +159,18 @@ public:
         ctx->clearHbFonts();
         layout->doLayoutRun(mChars, mStart, mCount, mNchars, mIsRtl, ctx);
     }
+    
+    void doEncryptedLayout(Layout* layout, LayoutContext* ctx, const FontCollection* collection) const {
+        layout->setFontCollection(collection);
+        layout->mAdvances.resize(mCount, 0);
+        ctx->clearHbFonts();
+        layout->doEncryptedLayoutRun(mCharsEncrypted, mStart, mCount, mNchars, mIsRtl, ctx);
+    }
 
 private:
     const uint16_t* mChars;
     size_t mNchars;
+    const void* mCharsEncrypted;
     size_t mStart;
     size_t mCount;
     uint32_t mId;  // for the font collection
@@ -179,6 +206,15 @@ public:
             layout = new Layout();
             key.doLayout(layout, ctx, collection);
             mCache.put(key, layout);
+        }
+        return layout;
+    }
+    
+    Layout* getEncrypted(LayoutCacheKey& key, LayoutContext* ctx, const FontCollection* collection) {
+        Layout* layout = NULL;
+        if (layout == NULL) {
+            layout = new Layout();
+            key.doEncryptedLayout(layout, ctx, collection);
         }
         return layout;
     }
@@ -250,7 +286,13 @@ hash_t LayoutCacheKey::computeHash() const {
     hash = JenkinsHashMix(hash, hash_type(mPaintFlags));
     hash = JenkinsHashMix(hash, hash_type(mHyphenEdit.hasHyphen()));
     hash = JenkinsHashMix(hash, hash_type(mIsRtl));
-    hash = JenkinsHashMixShorts(hash, mChars, mNchars);
+
+    if (mCharsEncrypted) {
+        hash = JenkinsHashMix(hash, hash_type(mCharsEncrypted));
+        hash = JenkinsHashMix(hash, hash_type(mNchars));
+    } else {
+    	hash = JenkinsHashMixShorts(hash, mChars, mNchars);
+    }
     return JenkinsHashWhiten(hash);
 }
 
@@ -594,6 +636,27 @@ void Layout::doLayout(const uint16_t* buf, size_t start, size_t count, size_t bu
     ctx.clearHbFonts();
 }
 
+void Layout::doEncryptedLayout(const void* buf, size_t start, size_t count, size_t bufSize,
+        int bidiFlags, const FontStyle &style, const MinikinPaint &paint) {
+    AutoMutex _l(gMinikinLock);
+
+    LayoutContext ctx;
+    ctx.style = style;
+    ctx.paint = paint;
+
+    bool isRtl = (bidiFlags & kDirection_Mask) != 0;
+    bool doSingleRun = true;
+
+    reset();
+    mAdvances.resize(count, 0);
+
+    //We don't support bidirectional text in Encrypted Mode.
+    if (doSingleRun) {
+        doEncryptedLayoutRunCached(buf, start, count, bufSize, isRtl, &ctx, start, mCollection, this, NULL);
+    }
+    ctx.clearHbFonts();
+}
+
 float Layout::measureText(const uint16_t* buf, size_t start, size_t count, size_t bufSize,
         int bidiFlags, const FontStyle &style, const MinikinPaint &paint,
         const FontCollection* collection, float* advances) {
@@ -653,6 +716,17 @@ float Layout::doLayoutRunCached(const uint16_t* buf, size_t start, size_t count,
     return advance;
 }
 
+void Layout::doEncryptedLayoutRunCached(const void* buf, size_t start, size_t count, size_t bufSize,
+        bool isRtl, LayoutContext* ctx, size_t dstStart, const FontCollection* collection, Layout* layout, float* advances) {
+    if (!isRtl) {
+		// In the encrypted mode, we treat the whole text as one word
+        doEncryptedLayoutWord(buf, start, count, bufSize, isRtl, ctx, dstStart, collection, layout, advances);
+    } else {
+		//Not supported
+		ALOGE("%s Error: right to left text not supported in Encrypted Mode.\n", __func__);
+    }
+}
+
 float Layout::doLayoutWord(const uint16_t* buf, size_t start, size_t count, size_t bufSize,
         bool isRtl, LayoutContext* ctx, size_t bufStart, const FontCollection* collection,
         Layout* layout, float* advances) {
@@ -678,6 +752,33 @@ float Layout::doLayoutWord(const uint16_t* buf, size_t start, size_t count, size
             layoutForWord->getAdvances(advances);
         }
         return layoutForWord->getAdvance();
+    }
+}
+
+void Layout::doEncryptedLayoutWord(const void* buf, size_t start, size_t count, size_t bufSize,
+        bool isRtl, LayoutContext* ctx, size_t bufStart, const FontCollection* collection, Layout* layout, float* advances) {
+    // Ignore, this is just to get rid of compiler errors complaining of not using parameters, passing for consistency
+    if (advances) {	// should never be true because always passing NULL to advances
+		ALOGD("%s Should not print - %p, %p, %p\n", __func__, collection, layout, advances);
+    }
+
+    LayoutCache& cache = LayoutEngine::getInstance().layoutCache;
+    LayoutCacheKey key(mCollection, ctx->paint, ctx->style, buf, start, count, bufSize, isRtl);
+    bool skipCache = ctx->paint.skipCache();
+    if (skipCache) {
+        ALOGE("%s Not supported\n", __func__);
+    } else {
+        Layout* layout_ = cache.getEncrypted(key, ctx, mCollection);
+		if (layout) {
+        	layout->appendEncryptedLayout(layout_, bufStart);
+		}
+	
+		if (advances) {
+	    	layout_->getAdvances(advances);
+		}
+		
+		mGlyphCodebook = layout_->mGlyphCodebook;
+		mCodebookSize = layout_->mCodebookSize;
     }
 }
 
@@ -860,6 +961,207 @@ void Layout::doLayoutRun(const uint16_t* buf, size_t start, size_t count, size_t
     mAdvance = x;
 }
 
+void Layout::doEncryptedLayoutRun(const void* buf, size_t start, size_t count, size_t bufSize,
+        bool isRtl, LayoutContext* ctx) {
+    uint16_t fake_buf[count];
+    uint16_t ascii_buf[ENCRYPTED_ASCII_NUM];
+    int i;
+
+    hb_buffer_t* buffer = LayoutEngine::getInstance().hbBuffer;
+    vector<FontCollection::Run> items;
+    mCollection->itemizeEncrypted(count, ctx->style, &items);
+    
+    if (isRtl) {
+        ALOGE("%s Error: Rtl not supported in Encrypted Mode\n", __func__);
+    }
+
+    if (items.size() != 1) {
+        ALOGE("%s Error: more than one font in Encrypted Mode!\n", __func__);
+    }
+
+    for (unsigned int j = 0; j < count; j++) {
+        fake_buf[j] = 46; //ascii code for .
+    }
+
+    //32 to 126 ASCII characters
+    for (i = 0; i < ENCRYPTED_ASCII_NUM; i++) {
+        ascii_buf[i] = i + 32;
+    }
+
+    vector<hb_feature_t> features;
+    // Disable default-on non-required ligature features if letter-spacing
+    // See http://dev.w3.org/csswg/css-text-3/#letter-spacing-property
+    // "When the effective spacing between two characters is not zero (due to
+    // either justification or a non-zero value of letter-spacing), user agents
+    // should not apply optional ligatures."
+    if (fabs(ctx->paint.letterSpacing) > 0.03)
+    {
+        static const hb_feature_t no_liga = { HB_TAG('l', 'i', 'g', 'a'), 0, 0, ~0u };
+        static const hb_feature_t no_clig = { HB_TAG('c', 'l', 'i', 'g'), 0, 0, ~0u };
+        features.push_back(no_liga);
+        features.push_back(no_clig);
+    }
+    addFeatures(ctx->paint.fontFeatureSettings, &features);
+
+    double size = ctx->paint.size;
+    double scaleX = ctx->paint.scaleX;
+    float x = mAdvance;
+    float y = 0;
+
+    for (size_t run_ix = 0; run_ix < items.size(); run_ix++) {
+        FontCollection::Run &run = items[run_ix];
+        if (run.fakedFont.font == NULL) {
+            ALOGE("no font for run starting at length %d", run.end - run.start);
+            continue;
+        }
+        int font_ix = findFace(run.fakedFont, ctx);
+        ctx->paint.font = mFaces[font_ix].font;
+        ctx->paint.fakery = mFaces[font_ix].fakery;
+        hb_font_t* hbFont = ctx->hbFonts[font_ix];
+#ifdef VERBOSE
+        std::cout << "Run " << run_ix << ", font " << font_ix <<
+            " [" << run.start << ":" << run.end << "]" << std::endl; 
+#endif
+		ALOGD("%p\n", buf); // To avoid compiler warnings about buf not being used. Kept for consistency.
+        hb_font_set_ppem(hbFont, size * scaleX, size);
+        hb_font_set_scale(hbFont, HBFloatToFixed(size * scaleX), HBFloatToFixed(size));
+
+        // TODO: if there are multiple scripts within a font in an RTL run,
+        // we need to reorder those runs. This is unlikely with our current
+        // font stack, but should be done for correctness.
+        ssize_t srunend;
+        for (ssize_t srunstart = run.start; srunstart < run.end; srunstart = srunend) {
+            srunend = srunstart;
+	    	// We don't support other languages and characters in Encrypted Mode
+            hb_script_t script = HB_SCRIPT_COMMON;
+	    	srunend = run.end;
+
+            double letterSpace = 0.0;
+            double letterSpaceHalfLeft = 0.0;
+            double letterSpaceHalfRight = 0.0;
+
+            if (ctx->paint.letterSpacing != 0.0 && isScriptOkForLetterspacing(script)) {
+                letterSpace = ctx->paint.letterSpacing * size * scaleX;
+                if ((ctx->paint.paintFlags & LinearTextFlag) == 0) {
+                    letterSpace = round(letterSpace);
+                    letterSpaceHalfLeft = floor(letterSpace * 0.5);
+                } else {
+                    letterSpaceHalfLeft = letterSpace * 0.5;
+                }
+                letterSpaceHalfRight = letterSpace - letterSpaceHalfLeft;
+            }
+
+	    	hb_buffer_clear_contents(buffer);
+            hb_buffer_set_script(buffer, script);
+            hb_buffer_set_direction(buffer, isRtl? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+
+            const FontLanguages& langList =
+                    FontLanguageListCache::getById(ctx->style.getLanguageListId());
+            if (langList.size() != 0) {
+                const FontLanguage* hbLanguage = &langList[0];
+                for (size_t i = 0; i < langList.size(); ++i) {
+                    if (langList[i].supportsHbScript(script)) {
+                        hbLanguage = &langList[i];
+                        break;
+                    }
+                }
+                hb_buffer_set_language(buffer,
+                        hb_language_from_string(hbLanguage->getString().c_str(), -1));
+            }
+
+            hb_buffer_add_utf16(buffer, fake_buf, bufSize, srunstart + start, srunend - srunstart);
+            hb_shape(hbFont, buffer, features.empty() ? NULL : &features[0], features.size());
+            unsigned int numGlyphs;
+            hb_glyph_info_t* info = hb_buffer_get_glyph_infos(buffer, &numGlyphs);
+            hb_glyph_position_t* positions = hb_buffer_get_glyph_positions(buffer, NULL);
+            if (numGlyphs)
+            {
+                mAdvances[info[0].cluster - start] += letterSpaceHalfLeft;
+                x += letterSpaceHalfLeft;
+            }
+            for (unsigned int i = 0; i < numGlyphs; i++) {
+    #ifdef VERBOSE
+                std::cout << positions[i].x_advance << " " << positions[i].y_advance << " " << positions[i].x_offset << " " << positions[i].y_offset << std::endl;            std::cout << "DoLayout " << info[i].codepoint <<
+                ": " << HBFixedToFloat(positions[i].x_advance) << "; " << positions[i].x_offset << ", " << positions[i].y_offset << std::endl;
+    #endif
+                if (i > 0 && info[i - 1].cluster != info[i].cluster) {
+                    mAdvances[info[i - 1].cluster - start] += letterSpaceHalfRight;
+                    mAdvances[info[i].cluster - start] += letterSpaceHalfLeft;
+                    x += letterSpace;
+                }
+
+                hb_codepoint_t glyph_ix = info[i].codepoint;
+                float xoff = HBFixedToFloat(positions[i].x_offset);
+                float yoff = -HBFixedToFloat(positions[i].y_offset);
+                xoff += yoff * ctx->paint.skewX;
+                LayoutGlyph glyph = {font_ix, glyph_ix, x + xoff, y + yoff};
+                mGlyphs.push_back(glyph);
+                float xAdvance = HBFixedToFloat(positions[i].x_advance);
+                if ((ctx->paint.paintFlags & LinearTextFlag) == 0) {
+                    xAdvance = roundf(xAdvance);
+                }
+
+                MinikinRect glyphBounds;
+                ctx->paint.font->GetBounds(&glyphBounds, glyph_ix, ctx->paint);
+                glyphBounds.offset(x + xoff, y + yoff);
+                mBounds.join(glyphBounds);
+
+                if (info[i].cluster - start < count) {
+                    mAdvances[info[i].cluster - start] += xAdvance;
+                } else {
+                    ALOGE("cluster %zu (start %zu) out of bounds of count %zu",
+                        info[i].cluster - start, start, count);
+                }
+
+                x += xAdvance;
+            }
+            if (numGlyphs)
+            {
+                mAdvances[info[numGlyphs - 1].cluster - start] += letterSpaceHalfRight;
+                x += letterSpaceHalfRight;
+            }
+
+	    	/* Construct the glyph book */
+            hb_buffer_clear_contents(buffer);
+            hb_buffer_set_script(buffer, script);
+            hb_buffer_set_direction(buffer, isRtl? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+
+            if (langList.size() != 0) {
+                const FontLanguage* hbLanguage = &langList[0];
+                for (size_t i = 0; i < langList.size(); ++i) {
+                    if (langList[i].supportsHbScript(script)) {
+                        hbLanguage = &langList[i];
+                        break;
+                    }
+                }
+                hb_buffer_set_language(buffer,
+                        hb_language_from_string(hbLanguage->getString().c_str(), -1));
+            }
+
+            hb_buffer_add_utf16(buffer, ascii_buf, ENCRYPTED_ASCII_NUM, 0, ENCRYPTED_ASCII_NUM);
+            hb_shape(hbFont, buffer, features.empty() ? NULL : &features[0], features.size());
+            info = hb_buffer_get_glyph_infos(buffer, &mCodebookSize);
+
+	    	if (mCodebookSize != ENCRYPTED_ASCII_NUM) {
+	        	ALOGD("%s Error: ENCRYPTED_ASCII_NUM (%d) and mCodebookSize (%d) are not equal\n",
+			    		__func__, ENCRYPTED_ASCII_NUM, mCodebookSize);
+				break;
+	    	}
+
+	    	if (mGlyphCodebook) {
+	        	ALOGD("%s Error: mGlyphCodebook must be NULL here\n", __func__);
+	    	}
+
+	    	mGlyphCodebook = new uint32_t[ENCRYPTED_ASCII_NUM];
+
+            for (unsigned int i = 0; i < mCodebookSize; i++) {
+                mGlyphCodebook[i] = info[i].codepoint;
+            }
+        }
+    }
+    mAdvance = x;
+}
+
 void Layout::appendLayout(Layout* src, size_t start) {
     int fontMapStack[16];
     int* fontMap;
@@ -885,6 +1187,46 @@ void Layout::appendLayout(Layout* src, size_t start) {
     for (size_t i = 0; i < src->mAdvances.size(); i++) {
         mAdvances[i + start] = src->mAdvances[i];
     }
+    MinikinRect srcBounds(src->mBounds);
+    srcBounds.offset(x0, 0);
+    mBounds.join(srcBounds);
+    mAdvance += src->mAdvance;
+
+    if (fontMap != fontMapStack) {
+        delete[] fontMap;
+    }
+}
+
+void Layout::appendEncryptedLayout(Layout* src, size_t start) {
+    int fontMapStack[16];
+    int* fontMap;
+
+    if (src->mFaces.size() < sizeof(fontMapStack) / sizeof(fontMapStack[0])) {
+        fontMap = fontMapStack;
+    } else {
+        fontMap = new int[src->mFaces.size()];
+    }
+
+    for (size_t i = 0; i < src->mFaces.size(); i++) {
+        int font_ix = findFace(src->mFaces[i], NULL);
+        fontMap[i] = font_ix;
+    }
+    int x0 = mAdvance;
+
+    for (size_t i = 0; i < src->mGlyphs.size(); i++) {
+        LayoutGlyph& srcGlyph = src->mGlyphs[i];
+        int font_ix = fontMap[srcGlyph.font_ix];
+        unsigned int glyph_id = srcGlyph.glyph_id;
+        float x = x0 + srcGlyph.x;
+        float y = srcGlyph.y;
+        LayoutGlyph glyph = {font_ix, glyph_id, x, y};
+        mGlyphs.push_back(glyph);
+    }
+
+    for (size_t i = 0; i < src->mAdvances.size(); i++) {
+        mAdvances[i + start] = src->mAdvances[i];
+    }
+
     MinikinRect srcBounds(src->mBounds);
     srcBounds.offset(x0, 0);
     mBounds.join(srcBounds);
@@ -962,6 +1304,14 @@ void Layout::getAdvances(float* advances) {
 
 void Layout::getBounds(MinikinRect* bounds) {
     bounds->set(mBounds);
+}
+
+const uint32_t *Layout::getGlyphCodebook() const {
+    return mGlyphCodebook;
+}
+
+unsigned int Layout::getCodebookSize() const {
+    return mCodebookSize;
 }
 
 void Layout::purgeCaches() {
